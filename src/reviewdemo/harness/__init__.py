@@ -39,6 +39,22 @@ class Harness(Protocol):
         """argv for a fresh interactive session in the agent's worktree."""
         ...
 
+    def resume_argv(
+        self, *, model: str, effort: str, rundir: str, session_uuid: str, ingress: str
+    ) -> list[str] | None:
+        """argv that reattaches to a previous conversation, or None.
+
+        This is what makes an agent's *memory* durable rather than just the
+        orchestration. A pane can die (crash, reboot, someone closes tmux)
+        while the worktree and the harness's own transcript survive on disk;
+        with this we respawn into the same worktree and the agent still knows
+        what it was doing.
+
+        Return None if the harness cannot resume -- the workflow will then
+        treat a dead pane as terminal instead of pretending it recovered.
+        """
+        ...
+
     def env(self, *, rundir: str, ingress: str) -> dict[str, str]:
         """Extra environment injected into the tmux session."""
         ...

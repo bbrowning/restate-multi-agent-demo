@@ -1,96 +1,64 @@
-# Code review: 3ada66fb6eb1 — Give the container labels a typed spec and one codec
+# Code review: 883ea4f5c3f9 — Give the podman backend a SessionResources collaborator
 
-- **Commit** `3ada66fb6eb17b8aba3be87462776f4d2c050739`
-- **Author** Ben Browning  ·  **Date** 2026-08-25T15:15:03Z
+- **Commit** `883ea4f5c3f93d60255f797974c0784f613b0f2a`
+- **Author** Ben Browning  ·  **Date** 2026-08-25T15:23:53Z
 - **Files changed** 5
-- **Diff base** `035db0c76aae`
+- **Diff base** `8d6eb1c1373d`
 
 Produced by independent reviews, merged by a third agent. Each agent ran as a real interactive session in its own tmux pane and its own git worktree, orchestrated by a Restate durable workflow.
 
-| Agent | Model | Effort | Review chars | Nudges | Wall time |
-| --- | --- | --- | ---: | ---: | ---: |
-| opus | opus | low | 1690 | 0 | 40s |
-| sonnet | sonnet | low | 2285 | 0 | 30s |
-| combiner | opus | low | 4363 | 0 | 40s |
+| Agent | Model | Effort | Review chars | Nudges | Respawns | Wall time | Workspace checkpoint |
+| --- | --- | --- | ---: | ---: | ---: | ---: | --- |
+| opus | opus | low | 2245 | 0 | 0 | 40s | 0098a69e3326 |
+| sonnet | sonnet | low | 540 | 0 | 0 | 30s | 2e53a57d3504 |
+| combiner | opus | low | 4089 | 0 | 0 | 40s | 8b3616ba4e8d |
 
 ---
 
-# Combined Review — `3ada66fb6eb1` "Give the container labels a typed spec and one codec"
+# Combined Review — SessionResources extraction (podman backend)
 
-Merging Review A (`opus`, effort low) and Review B (`sonnet`, effort low), both
-verified against the checked-out working tree.
+Merging Review A (opus) and Review B (sonnet). Both were run at **low effort**; claims below were re-checked against the working tree.
 
 ## 1. Verdict
 
-Safe to ship. Both reviewers independently found no correctness defects, and my
-own check confirms the diff is a faithful move of the label codec from
-`src/paude/backends/podman/helpers.py` into `src/paude/backends/labels.py` with
-call sites updated, plus new-but-untested-in-production groundwork
-(`SessionSpec`, `LabeledSession`, `read_labels`, `spec_from_labels`,
-`normalize_agent_providers`) that is covered by `tests/test_labels.py`;
-`make lint` passes clean.
+Safe to ship. Both reviewers independently reported zero findings, and spot-checking the diff confirms the extraction is behavior-preserving: `rollback_create` and `cleanup_all` reproduce the deleted `_rollback_session_resources` / `_cleanup_session_resources` step-for-step, and every call site is a direct delegation.
 
 ## 2. Agreed findings
 
-None. Both reviews concluded "no bugs found" on the non-test hunks, and both
-independently characterised the change the same way: a mechanical
-move/consolidation with logic unchanged from the original implementations.
-There is no issue raised by both reviewers to de-duplicate.
+**None.** Both reviews concluded the commit contains no defects.
+
+The two reviews agree substantively on the reasoning, not just the conclusion:
+
+- The moved logic is equivalent to what was removed. Verified: `resources.py:131-142` matches the deleted `backend.py` rollback (same `config.proxy_image` guard, same `volume_reused` guard, same `force=True`), and `resources.py:144-157` matches the deleted cleanup (network, the `volume_exists`-guarded CA/auth volumes, `remove_credential_secrets`, `remove_volume_verified`, trailing `remove_secret(GCP_ADC_SECRET_NAME)`).
+- Call sites are plain delegations: `backend.py:150`, `backend.py:217`, `backend.py:232`.
 
 ## 3. Unique findings
 
-### A. (sonnet) Broad exception swallowing in `decode_json_label` — `src/paude/backends/labels.py:90-99`
-**Real, but pre-existing and not introduced here.** `decode_json_label` catches
-`binascii.Error, UnicodeError, json.JSONDecodeError, ValueError` around the
-base64 path, falls back to raw-JSON parsing, and returns `None` on total
-failure (`labels.py:95-99`). Sonnet correctly labelled it informational: the
-body is byte-identical to the former `_decode_json_label`, so this diff neither
-adds nor worsens the behaviour. Worth noting that the fallback is deliberate —
-it is what lets legacy raw-JSON labels still decode — so "fixing" it would be a
-compatibility regression, not a cleanup. No action.
+Neither review raised a defect, so this section covers the unique *verification claims* each made.
 
-### B. (sonnet) Function-local import in `workspace_from_labels` — `src/paude/backends/labels.py:181`
-**Real observation, but sonnet's stated rationale is wrong.** The import
-(`from paude.backends.session_env import decode_path`) is indeed the only
-non-top-level import in the diff. Sonnet guessed it was a circular-import
-workaround; it is not. `session_env` imports only `paude.agents.base` at
-runtime and never imports `labels`, so hoisting the import to module scope
-would not create a cycle. That makes this incidental rather than intentional —
-a genuine (if trivial) nit worth hoisting, and one sonnet flagged for the wrong
-reason. Cosmetic; does not block.
+**Review A (opus) only:**
 
-### C. (opus) Unused `Any` import in `podman/helpers.py:10` — raised and self-dismissed
-Opus surfaced this as a candidate and then dismissed it in the same report.
-**The dismissal is correct.** `Any` is still used at `helpers.py:41`, `:141`,
-and `:161`. I confirmed independently: `make lint` passes with no unused-import
-error. Listed here only because opus published it; it is not an open finding.
+- *Shared helper `_remove_proxy_and_network` is a safe collapse* (`resources.py:159-162`). **Real and correct.** Both prior call sites used force/tolerant removal followed by `remove_network`.
+- *No destructive-default regression in `teardown_for_rebuild`* (`resources.py:112-129`). **Real and correct.** It touches only container, proxy, network and CA volume; workspace volume, auth volume and credential secrets are untouched.
+- *Dropped imports leave no stale references* (`backend.py:31`, `backend.py:38`, removal of `network_name` and `GCP_ADC_SECRET_NAME`). **Correct** — verified no remaining uses in `backend.py`.
+- *Runner methods backing the new read accessors exist* (`container/runner.py:368`, `:434`). **Correct**, and used at `resources.py:78` and `resources.py:82`.
+
+**Review B (sonnet) only:**
+
+- *Included the test files in scope* (`tests/fakes.py`, `tests/test_session_resources.py`, `tests/test_upgrade.py`) and found nothing. Review A explicitly excluded them. **Reasonable**; the test changes are fixture updates plus coverage for the new class, and nothing there weakens an existing assertion.
 
 ## 4. Inconsistencies
 
-**None substantive.** The two reviews reach the same verdict and disagree on
-nothing factual. The only asymmetry is coverage, not contradiction: sonnet
-reported two informational items opus did not mention, and opus reported (then
-dismissed) one candidate sonnet did not raise. Adjudication of each is in
-section 3 — every one of the three resolves to "no action required."
+One contradiction, both minor and both resolvable from the code:
 
-Both reviewers also independently noted that the new `labels.py` API has no
-in-tree production callers yet, and both declined to flag it as dead code —
-opus explicitly (groundwork for the container-state migration in `035db0c`,
-covered by `tests/test_labels.py`), sonnet implicitly. I agree: flagging it
-would be wrong.
+1. **Scope.** A excluded test files; B included them. Not a disagreement about the code — **B's scope is the better one** for this commit, since `tests/test_upgrade.py` lost 25 lines and deserved a look. Outcome is unaffected: neither found an issue.
+
+2. **Where `auth_volume_name` / `ca_volume_name` moved from.** A says they moved "from a function-local import to a module-level import from `helpers.py`, where both are defined." **Adjudication: A's conclusion is right, its provenance is slightly off.** The deleted function-local import was `from paude.backends.podman.proxy import ...`; the new module-level import (`resources.py:36-43`) pulls from `helpers.py`, which is indeed where they are defined (`helpers.py:102`, `helpers.py:107`). `proxy.py` was re-exporting. Harmless.
+
+B's blanket "byte-for-byte equivalent" phrasing is also loose — `teardown_for_rebuild`, `migrate_legacy_state`, `labels`, `exists`, `running` and `image` (`resources.py:72-129`) are not moved-from-`backend.py` code. The equivalence claim holds for the two teardown methods it was about.
 
 ## 5. Noise
 
-- **`src/paude/backends/podman/helpers.py:10` — unused `Any` import (opus).**
-  False positive, already retracted by the reviewer that raised it. `Any`
-  survives at three sites in the same file (`:41`, `:141`, `:161`) and lint is
-  green.
-- **`src/paude/backends/labels.py:181` — "likely circular-import workaround"
-  (sonnet).** The *observation* is valid (section 3B), but the *diagnosis* is
-  noise: there is no import cycle between `labels` and `session_env` to work
-  around, so a reader acting on sonnet's framing would go looking for a
-  dependency problem that does not exist.
-- **`src/paude/backends/labels.py:90-99` — broad `except` (sonnet).** Borderline
-  noise for a diff review: unchanged pre-existing code, deliberately permissive
-  for legacy-label compatibility. Correctly marked informational rather than a
-  finding.
+No false-positive findings to report — neither review raised any finding at all.
+
+The one thing worth flagging as an unearned claim rather than a finding: B's "byte-for-byte equivalent ... no behavior change" overstates a diff that also *adds* new surface (a public `resources` property at `backend.py:87-93` and six new methods). The added surface is fine, but it was not verified by the equivalence argument B gave for it.

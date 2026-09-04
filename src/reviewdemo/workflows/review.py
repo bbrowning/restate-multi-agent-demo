@@ -111,8 +111,15 @@ async def run(ctx: restate.WorkflowContext, req: dict) -> dict:
 
     # --- fan in: synthesise ----------------------------------------------
     a, b = results[0], results[1]
+    # Hand the combiner a workspace, not just files: it starts from whichever
+    # reviewer's frozen checkpoint is named (default: the first), so anything
+    # that reviewer left on disk travels with it. Set inherit_workspace=null to
+    # start from the pristine commit instead.
+    inherit_id = req.get("inherit_workspace", reviewers[0]["agent_id"])
+    inherit_from = next((r for r in results if r["agent_id"] == inherit_id), None)
     combiner_spec = _combiner_spec(
-        run_id, combiner, repo, meta, root, a, b, ingress, req.get("deadline_s", 1800)
+        run_id, combiner, repo, meta, root, a, b, ingress, req.get("deadline_s", 1800),
+        inherit_from=inherit_from,
     )
     combined = await ctx.workflow_call(
         agent_wf.run, key=f"{run_id}-{combiner['agent_id']}", arg=combiner_spec
@@ -133,7 +140,9 @@ async def run(ctx: restate.WorkflowContext, req: dict) -> dict:
         "reviews": [r["outfile"] for r in results],
         "agents": [
             {"agent": r["agent_id"], "model": r["model"], "effort": r["effort"],
-             "chars": r["chars"], "nudges": r["nudges"], "elapsed_s": r["elapsed_s"]}
+             "chars": r["chars"], "nudges": r["nudges"],
+             "respawns": r.get("respawns", 0), "elapsed_s": r["elapsed_s"],
+             "checkpoint": r.get("checkpoint")}
             for r in results + [combined]
         ],
     }
@@ -187,9 +196,24 @@ def _reviewer_spec(run_id, spec_in, repo, meta, root, level, ingress, deadline) 
     }
 
 
-def _combiner_spec(run_id, combiner, repo, meta, root, a, b, ingress, deadline) -> dict:
+def _combiner_spec(run_id, combiner, repo, meta, root, a, b, ingress, deadline,
+                   inherit_from=None) -> dict:
+    """Build the combiner's spec.
+
+    `inherit_from` is a reviewer result whose workspace checkpoint the combiner
+    should start from -- filesystem state handed from one node to the next. We
+    check out that agent's frozen commit and soft-reset to the *original*
+    parent, so the combiner sees the reviewed change plus whatever that agent
+    left behind, all as pending work. Falls back to the raw commit when the
+    agent changed nothing (checkpoint is None).
+    """
     agent_id = combiner["agent_id"]
     outfile = os.path.join(root, "combined.md")
+    start_commit = meta["sha"]
+    inherited = None
+    if inherit_from and inherit_from.get("checkpoint"):
+        start_commit = inherit_from["checkpoint"]
+        inherited = f"{inherit_from['agent_id']}@{start_commit[:12]}"
     text = COMBINE_TURN.format(
         sha=meta["sha"][:12], subject=meta["subject"],
         a_model=a["model"], a_file=a["outfile"],
@@ -198,7 +222,8 @@ def _combiner_spec(run_id, combiner, repo, meta, root, a, b, ingress, deadline) 
     return {
         "run_id": run_id, "agent_id": agent_id, "harness": combiner["harness"],
         "model": combiner["model"], "effort": combiner["effort"],
-        "repo": repo, "commit": meta["sha"], "base": meta["base"],
+        "repo": repo, "commit": start_commit, "base": meta["base"],
+        "inherited_workspace": inherited,
         "rundir": os.path.join(root, agent_id),
         "workdir": os.path.join(root, agent_id, "wt"),
         "outfile": outfile, "ingress": ingress, "deadline_s": deadline,
@@ -225,13 +250,14 @@ def _assemble(root: str, meta: dict, results: list, combined: dict) -> dict:
         "interactive session in its own tmux pane and its own git worktree, orchestrated by "
         "a Restate durable workflow.",
         "",
-        "| Agent | Model | Effort | Review chars | Nudges | Wall time |",
-        "| --- | --- | --- | ---: | ---: | ---: |",
+        "| Agent | Model | Effort | Review chars | Nudges | Respawns | Wall time | Workspace checkpoint |",
+        "| --- | --- | --- | ---: | ---: | ---: | ---: | --- |",
     ]
     for r in results + [combined]:
         lines.append(
             f"| {r['agent_id']} | {r['model']} | {r['effort']} | {r['chars']} | "
-            f"{r['nudges']} | {r['elapsed_s']}s |"
+            f"{r['nudges']} | {r.get('respawns', 0)} | {r['elapsed_s']}s | "
+            f"{(r.get('checkpoint') or '-')[:12]} |"
         )
     lines += ["", "---", "", body]
 

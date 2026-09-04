@@ -92,5 +92,34 @@ def add(repo: str, path: str, commit: str, soft_reset_to: str | None = None) -> 
     return path
 
 
+def checkpoint(path: str, message: str) -> str | None:
+    """Freeze an agent's working tree into an immutable commit; return its sha.
+
+    This is workspace checkpointing on the substrate we already have. The
+    workspace *is* a git repo, so a commit is a content-addressed snapshot of
+    the whole tree -- cheap (objects are shared with the source repo), and
+    crucially a **small, stable pointer** that Restate can journal.
+
+    That pointer/bytes split is the whole trick: Restate stores values, not
+    filesystems, and its docs warn against putting blobs in the journal. A sha
+    is 40 bytes and, because journal entries replay identically, the next node
+    reconstructs *exactly* the same tree on a retry as it did on the first run.
+
+    Returns None when the agent changed nothing (there is no snapshot to take).
+    Commits with an explicit machine identity so these never look hand-made.
+    """
+    _git(path, "add", "-A")
+    staged = _git(path, "diff", "--cached", "--name-only", check=False)
+    if not staged.strip():
+        return None
+    _git(
+        path,
+        "-c", "user.name=reviewdemo",
+        "-c", "user.email=reviewdemo@localhost",
+        "commit", "--no-verify", "--no-gpg-sign", "-m", message,
+    )
+    return _git(path, "rev-parse", "HEAD")
+
+
 def remove(repo: str, path: str) -> None:
     _git(repo, "worktree", "remove", "--force", path, check=False)

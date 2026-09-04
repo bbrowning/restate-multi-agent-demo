@@ -34,6 +34,8 @@ agent = restate.Workflow(
 TICK_S = 10
 IDLE_TICKS_FOR_DONE = 2      # consecutive quiet reads before believing a turn ended
 MAX_NUDGES_PER_TURN = 2
+# A pane that dies repeatedly is not going to be fixed by trying harder.
+MAX_RESPAWNS = 2
 
 
 def _read_if_ready(path: str, min_chars: int = 40) -> dict:
@@ -64,7 +66,11 @@ async def run(ctx: restate.WorkflowContext, spec: dict) -> dict:
     ctx.set("phase", "preparing")
 
     # --- isolate: one disposable checkout per agent ----------------------
+    # ctx.uuid() is journalled, so this is stable across replays -- which is
+    # exactly what makes the transcript path predictable and resume possible.
     session_uuid = str(ctx.uuid())
+    spec["session_uuid"] = session_uuid
+    spec["ingress"] = ingress
     await ctx.run_typed(
         "make-worktree",
         lambda: (
@@ -90,6 +96,7 @@ async def run(ctx: restate.WorkflowContext, spec: dict) -> dict:
 
     # --- drive the conversation, one supervised turn at a time -----------
     nudges_total = 0
+    respawns_total = 0
     elapsed = 0
     for index, turn in enumerate(spec["turns"]):
         ctx.set("phase", f"turn-{index}")
@@ -98,6 +105,7 @@ async def run(ctx: restate.WorkflowContext, spec: dict) -> dict:
         )
         elapsed = got["elapsed"]
         nudges_total += got["nudges"]
+        respawns_total += got["respawns"]
 
     # --- collect: the artifact is the authority ---------------------------
     outfile = spec["outfile"]
@@ -109,15 +117,29 @@ async def run(ctx: restate.WorkflowContext, spec: dict) -> dict:
             f"{spec['agent_id']}: finished its turns but produced no {outfile}", 500
         )
 
+    # --- checkpoint: freeze the workspace as this agent left it -----------
+    # The commit is the snapshot; the sha is what we hand downstream. Restate
+    # journals the sha (40 bytes), git holds the bytes.
+    checkpoint_sha = await ctx.run_typed(
+        "checkpoint-workspace",
+        lambda: worktree.checkpoint(
+            spec["workdir"], f"reviewdemo checkpoint: {spec['run_id']}/{spec['agent_id']}"
+        ),
+        restate.RunOptions(type_hint=str),
+    )
+    ctx.set("checkpoint", checkpoint_sha)
+
     ctx.set("phase", "done")
     ctx.set("chars", final["chars"])
     return {
+        "checkpoint": checkpoint_sha,
         "agent_id": spec["agent_id"],
         "ok": True,
         "outfile": outfile,
         "chars": final["chars"],
         "session": session,
         "nudges": nudges_total,
+        "respawns": respawns_total,
         "elapsed_s": elapsed,
         "model": spec["model"],
         "effort": spec["effort"],
@@ -161,6 +183,7 @@ async def _run_turn(
     elapsed = elapsed_start
     idle_streak = 0
     nudges = 0
+    respawns = 0
     hook_done = False
 
     while True:
@@ -182,7 +205,23 @@ async def _run_turn(
             pane_obj.probe, key=session, arg={"harness": harness.name}
         )
         if snap["state"] == "dead":
-            raise restate.TerminalError(f"{session}: agent process died mid-turn", 500)
+            # The pane died, but the *workspace* did not: the worktree is still
+            # on disk and the harness's own transcript survives under the
+            # session id we pinned. If the harness can reattach, respawn into
+            # the same worktree and carry on with the agent's memory intact.
+            respawns = await _recover(
+                ctx, spec, harness, session, respawns, turn, index
+            )
+            idle_streak = 0
+            hook_done = False
+            if use_hook:
+                awk_id, done_fut = ctx.awakeable(type_hint=dict)
+                await ctx.run_typed(
+                    f"rearm-dead-{index}-{respawns}",
+                    lambda: _write(os.path.join(rundir, "awakeable.id"), awk_id),
+                    restate.RunOptions(type_hint=str),
+                )
+            continue
 
         idle_streak = idle_streak + 1 if snap["state"] != "busy" else 0
         artifact = await ctx.run_typed(
@@ -212,12 +251,12 @@ async def _run_turn(
             # seconds while the review is still running. Requiring sustained
             # quiet is what stops us racing ahead to the next turn.
             if idle_streak >= IDLE_TICKS_FOR_DONE:
-                return {"elapsed": elapsed, "nudges": nudges}
+                return {"elapsed": elapsed, "nudges": nudges, "respawns": respawns}
             continue
 
         settled = hook_done or idle_streak >= IDLE_TICKS_FOR_DONE
         if settled and artifact["present"]:
-            return {"elapsed": elapsed, "nudges": nudges}
+            return {"elapsed": elapsed, "nudges": nudges, "respawns": respawns}
 
         if settled:
             # It stopped without delivering. Nudge, bounded -- then give up
@@ -241,6 +280,48 @@ async def _run_turn(
                      "text": turn.get("nudge") or turn["text"]},
             )
             idle_streak = 0
+
+
+async def _recover(
+    ctx: restate.WorkflowContext, spec: dict, harness, session: str,
+    respawns: int, turn: dict, index: int,
+) -> int:
+    """Bring a dead agent back into the same worktree, or fail honestly.
+
+    What makes this possible is that the three durable things live outside the
+    pane: the git worktree is on disk, the harness's transcript is on disk
+    under the session id we pinned at launch, and finished artifacts were
+    written outside the worktree. Only the process was ephemeral.
+    """
+    if respawns >= MAX_RESPAWNS:
+        raise restate.TerminalError(
+            f"{session}: agent died {respawns} times; giving up", 500
+        )
+    argv = harness.resume_argv(
+        model=spec["model"], effort=spec["effort"], rundir=spec["rundir"],
+        session_uuid=spec["session_uuid"], ingress=spec["ingress"],
+    )
+    if argv is None:
+        raise restate.TerminalError(
+            f"{session}: agent died and harness {harness.name!r} cannot resume", 500
+        )
+
+    respawns += 1
+    ctx.set("phase", f"turn-{index}:respawning")
+    await ctx.object_call(
+        pane_obj.respawn, key=session,
+        arg={"harness": harness.name, "cwd": spec["workdir"], "argv": argv,
+             "env": harness.env(rundir=spec["rundir"], ingress=spec["ingress"])},
+    )
+    await ctx.object_call(pane_obj.await_ready, key=session, arg={"harness": harness.name})
+    # Re-ask for the turn. Prefer the nudge wording: the agent may well have
+    # already done the work before it died, and the nudge is phrased to make
+    # that case cheap ("you have not written X yet").
+    await ctx.object_call(
+        pane_obj.submit, key=session,
+        arg={"harness": harness.name, "text": turn.get("nudge") or turn["text"]},
+    )
+    return respawns
 
 
 def _write(path: str, value: str) -> str:

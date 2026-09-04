@@ -75,6 +75,28 @@ class ClaudeHarness:
             "--settings", json.dumps(self.settings(rundir=rundir, ingress=ingress)),
         ]
 
+    def resume_argv(
+        self, *, model: str, effort: str, rundir: str, session_uuid: str, ingress: str
+    ) -> list[str] | None:
+        """Reattach to the pinned session id.
+
+        Because launch_argv pins --session-id, the transcript lands at a known
+        path under ~/.claude/projects/<slugified-cwd>/<uuid>.jsonl and survives
+        the pane dying. `--resume <uuid>` in the same worktree restores the
+        whole conversation -- verified by hand: a resumed session still knew
+        the review it had produced and the file it had written.
+
+        --resume replaces --session-id; passing both conflicts.
+        """
+        return [
+            "claude",
+            "--resume", session_uuid,
+            "--model", model,
+            "--effort", effort,
+            "--permission-mode", "bypassPermissions",
+            "--settings", json.dumps(self.settings(rundir=rundir, ingress=ingress)),
+        ]
+
     def env(self, *, rundir: str, ingress: str) -> dict[str, str]:
         return {"RD_RUNDIR": rundir, "RD_INGRESS": ingress}
 

@@ -8,11 +8,14 @@ something observed on a live TUI -- see the comments for what and why.
 
 from __future__ import annotations
 
+import os
+import pathlib
+import subprocess
 import time
 
 import pytest
 
-from reviewdemo import tmux
+from reviewdemo import tmux, worktree
 from reviewdemo.harness import classify, get, prompt_empty
 
 CLAUDE = get("claude")
@@ -97,6 +100,64 @@ class TestHarnessSeam:
         # The seam exists precisely because harnesses differ here.
         assert get("claude").done_strategy == "hook"
         assert get("codex").done_strategy == "quiescence"
+
+
+class TestWorkspaceCheckpoint:
+    """Filesystem checkpointing: freeze a workspace, hand the sha to the next node.
+
+    Uses this repo's own git history so the test needs no fixture repo.
+    """
+
+    repo = "/pvc/workspace"
+    base_dir = "/tmp/rd-ckpt-test"
+
+    def _fresh(self, name, commit, base=None):
+        path = f"{self.base_dir}-{name}"
+        subprocess.run(["git", "-C", self.repo, "worktree", "remove", "--force", path],
+                       capture_output=True)
+        worktree.add(self.repo, path, commit, soft_reset_to=base)
+        return path
+
+    def teardown_method(self):
+        for suffix in ("a", "b"):
+            subprocess.run(
+                ["git", "-C", self.repo, "worktree", "remove", "--force",
+                 f"{self.base_dir}-{suffix}"], capture_output=True)
+        subprocess.run(["git", "-C", self.repo, "worktree", "prune"], capture_output=True)
+
+    @pytest.mark.skipif(not os.path.isdir("/pvc/workspace/.git"),
+                        reason="needs the source repo")
+    def test_checkpoint_roundtrip(self):
+        sha = worktree.resolve(self.repo, "883ea4f")
+        base = worktree.diff_base(self.repo, sha)
+        wt = self._fresh("a", sha, base)
+
+        # an agent leaves something on disk that is not part of the commit
+        pathlib.Path(wt, "AGENT_NOTES.md").write_text("scratch\n")
+        checkpoint = worktree.checkpoint(wt, "test")
+        assert checkpoint and len(checkpoint) == 40
+
+        # a second checkpoint with no further edits has nothing to snapshot
+        assert worktree.checkpoint(wt, "test") is None
+
+        # the next node reconstructs that exact tree from the sha alone
+        restored = self._fresh("b", checkpoint, base)
+        assert pathlib.Path(restored, "AGENT_NOTES.md").read_text() == "scratch\n"
+
+    @pytest.mark.skipif(not os.path.isdir("/pvc/workspace/.git"),
+                        reason="needs the source repo")
+    def test_soft_reset_makes_the_commit_pending_work(self):
+        # Why it matters: in a clean checkout `git diff` is empty, so a harness
+        # that reviews "the current diff" would review nothing at all.
+        sha = worktree.resolve(self.repo, "883ea4f")
+        base = worktree.diff_base(self.repo, sha)
+        wt = self._fresh("a", sha, base)
+        head = subprocess.run(["git", "-C", wt, "rev-parse", "HEAD"],
+                              capture_output=True, text=True).stdout.strip()
+        assert head == base
+        pending = subprocess.run(["git", "-C", wt, "status", "--short"],
+                                 capture_output=True, text=True).stdout
+        assert pending.strip(), "the commit under review must appear as pending work"
 
 
 class TestTmux:

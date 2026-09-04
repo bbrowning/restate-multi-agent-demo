@@ -36,6 +36,15 @@ class CodexHarness:
     ) -> list[str]:
         return ["codex", "--model", model]
 
+    def resume_argv(
+        self, *, model: str, effort: str, rundir: str, session_uuid: str, ingress: str
+    ) -> list[str] | None:
+        # Unverified whether codex can reattach to a prior conversation, so we
+        # say "no" rather than guess. A dead pane is then terminal for this
+        # harness -- an honest failure beats a silent one that respawns an
+        # agent with no memory of what it was doing.
+        return None
+
     def env(self, *, rundir: str, ingress: str) -> dict[str, str]:
         return {"RD_RUNDIR": rundir, "RD_INGRESS": ingress}
 

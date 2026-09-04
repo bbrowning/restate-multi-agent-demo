@@ -144,6 +144,31 @@ async def submit(ctx: restate.ObjectContext, req: dict) -> dict:
     return out
 
 
+@pane.handler()
+async def respawn(ctx: restate.ObjectContext, req: dict) -> dict:
+    """Replace a dead pane, reusing the same session name and workdir.
+
+    Distinct from `spawn`, which is deliberately a no-op when the session
+    exists: here we must tear down the corpse first, or `new_session` would
+    see the name still registered and quietly do nothing.
+
+    req: {harness, cwd, argv, env}
+    """
+    session = ctx.key()
+
+    async def _respawn() -> dict:
+        tmux.kill_session(session)
+        tmux.new_session(session, req["cwd"], req["argv"], req.get("env") or {})
+        return {"session": session, "respawned": True}
+
+    out = await ctx.run_typed(
+        "tmux-respawn", _respawn, restate.RunOptions(type_hint=dict, max_attempts=2)
+    )
+    count = (await ctx.get("respawns", type_hint=int)) or 0
+    ctx.set("respawns", count + 1)
+    return out
+
+
 @pane.handler(kind="shared")
 async def probe(ctx: restate.ObjectSharedContext, req: dict) -> dict:
     """Read-only liveness snapshot. Shared, so it runs during a submit.

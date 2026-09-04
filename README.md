@@ -17,7 +17,10 @@ happen in front of you.
 
 Restate's job is to make that orchestration **durable**: kill the orchestrator
 mid-run and the workflow picks up exactly where it left off, while the agents
-themselves keep working in their panes.
+themselves keep working in their panes. Kill an *agent* and it is respawned
+with `--resume` into the same worktree, so it still remembers what it was
+doing. Each agent's workspace is checkpointed to a git sha and handed to the
+next node.
 
 ```
 ReviewWorkflow  (Workflow, key = run id)             fan-out / fan-in / report
@@ -72,7 +75,7 @@ Output lands in `runs/<run-id>/`: `report.md`, `reviews/opus.md`,
 `reviews/sonnet.md`, plus each agent's `turns.jsonl`.
 
 ```bash
-uv run python -m pytest tests/ -q   # 16 tests, ~2s, no LLM calls
+uv run python -m pytest tests/ -q   # 18 tests, ~2s, no LLM calls
 ./scripts/dev.sh status | logs | down
 ./scripts/clean.sh <run-id>         # release worktrees + panes for a run
 ```
@@ -101,8 +104,12 @@ at any git repo.
 6. **Fan in.** Both reviewer futures go to `restate.gather`. The combiner then
    gets its own worktree and pane, reads both review files, and writes the
    merged report.
-7. **Assemble.** Provenance header (commit, models, efforts, nudge counts, wall
-   time) is prepended to the combiner's markdown.
+7. **Checkpoint.** Each agent's worktree is committed, freezing the tree as it
+   left it; the sha goes into the journal and the result. The combiner starts
+   from a reviewer's checkpoint rather than the raw commit — see
+   [Workspace durability](#workspace-durability-checkpointing-a-filesystem-and-passing-it-on).
+8. **Assemble.** Provenance header (commit, models, efforts, nudge counts,
+   respawns, checkpoints, wall time) is prepended to the combiner's markdown.
 
 ## What Restate is doing, for people who haven't used it
 
@@ -199,6 +206,54 @@ outside `ctx.run`, no bare `except Exception:`), and you give up gascity's
 richer agent ecosystem. What you get is that **crash recovery stops being your
 problem**.
 
+**vs. [crucible](https://github.com/neuralmagic/crucible)** (Neural Magic / Red
+Hat; Rust; an autonomous goal-directed research-loop engine). The closest
+sibling to this demo, and worth being precise about because it overlaps in
+shape while differing completely in substrate.
+
+*Where it does the same thing:* crucible's `examples/adversarial-review` is
+almost exactly this demo's graph — two isolated reviewers fanned out from one
+candidate, joined by a gate, with per-task model and effort (Opus at high
+effort blocking, Sonnet advisory via `required = false`). **The fan-out/fan-in
+shape is not novel here**, and crucible's join semantics are better specified
+than mine: `join = "passed"`, advisory tasks, budget-as-terminal-state, and
+fail-closed truncation when a required task can never run. It even documents
+the third "synthesize" agent that merges the reviewers — as a recipe, not a
+shipped example.
+
+*Where it differs fundamentally:* crucible drives `claude -p --output-format
+stream-json` over **pipes** — `Stdio::piped()`, no pty, and zero tmux anywhere
+in the repo. There is no live session to attach to and nothing to type into;
+its human-in-the-loop is `STEER.md`, appended between iterations. That is a
+deliberate, defensible choice for an unattended optimization loop. It is simply
+a different thing from "watch the agent work and nudge it," which is what this
+demo is about.
+
+*Where crucible is well ahead:* a **frozen judge** the agent is structurally
+prevented from tuning (the engine hands the agent a `World`, never a `Judge`),
+capability admission that refuses a graph before dispatch, budget as a
+first-class terminal state, deny-by-default egress with a host-side credential
+broker, Kubernetes sandbox pods, and a real OTel/S3/PR/Slack observability
+stack. None of that exists here.
+
+*On durability, the comparison is the interesting part.* crucible hand-rolls
+what Restate provides: an append-only `state/session.jsonl` as source of truth,
+a `--resume` path with a recovery classifier that names how a run died
+(`DiedMidTurn`, `DiedDeciding`, `DiedInPlanTask`, …), a content-hash-keyed step
+ledger, and — notably — `flock(2)` on a sidecar file plus write-tmp-then-rename
+for its agent-session ledger, the same mechanism this README attributes to
+gascity. Their own ADRs are candid about the limits: the step ledger
+"deliberately does not touch" the plan executor, `died_in_plan_task` is "coarse
+by construction" because task results are batched, and the ledger's storage is
+an `emptyDir` today so replay "covers a broker restart within a live pod, not
+pod death." That is precisely the class of work a durable-execution runtime
+does for you.
+
+*Maturity, stated plainly:* ~5 weeks old at the time of writing, 259 commits,
+effectively one author, one release, 8 stars — and extremely active (44 commits
+in a week). Neither a warning nor an endorsement; just don't read it as widely
+deployed, or as abandoned.
+
 **vs. Temporal / Airflow.** Same durable-execution family. Restate is a single
 self-contained binary with no external database (a ~45MB download, ~200MB on
 disk), which is why this whole demo bootstraps on a box with no Docker and no
@@ -211,6 +266,30 @@ integrations).** Those orchestrate *API calls*. This demo deliberately drives
 modes and settings a human uses. If your reason for multi-agent work is "I want
 what I get in my terminal, but three of them, supervised," an API-level
 framework does not give you that.
+
+### Two kinds of death, two kinds of recovery
+
+**The orchestrator dies.** Restate's own job. Invocations go to `backing-off`,
+the panes keep working, and when the endpoint returns the journal replays and
+the run continues.
+
+**An agent dies.** Restate cannot help here — a dead pane is outside its world
+— so the workflow handles it, using state that outlived the process:
+
+- the **git worktree** is still on disk
+- the harness's **own transcript** is still on disk, under the session id we
+  pinned at launch (`--session-id`), which is why its path is predictable
+- **finished artifacts** were written *outside* the worktree by design
+
+So a dead pane is respawned with `harness.resume_argv()` — for Claude,
+`--resume <uuid>` in the same worktree — and the current turn is re-asked using
+the nudge wording. Verified by killing a reviewer's pane mid-review: it came
+back and finished writing findings it had produced *before* it was killed, so
+this restores the agent's memory, not just its process. Bounded by
+`MAX_RESPAWNS`, and reported as `respawns=1` in the run result.
+
+A harness that returns `None` from `resume_argv` (the codex stub) fails
+honestly instead of respawning an agent with amnesia.
 
 ### The payoff, demonstrated
 
@@ -235,6 +314,109 @@ Inspect anything at any time:
 curl -s localhost:9070/query --json '{"query":"SELECT target_service_key, status FROM sys_invocation"}'
 curl -s -X POST --max-time 5 localhost:8080/restate/call/ReviewWorkflow/<run>/status
 ```
+
+## Workspace durability: checkpointing a filesystem and passing it on
+
+A distinct question from crash recovery: **can you freeze the filesystem inside
+an agent's workspace and hand that exact state to the next node?** Worth
+answering carefully, because the honest answer starts with a "no".
+
+### Restate does not do this, and that is the right layer for it not to
+
+Restate journals **values** — small JSON — and its own guidance is to keep
+blobs out of the journal. It has no concept of a filesystem, a volume, or a
+workspace. So there is no "how Restate does it" to evaluate.
+
+What Restate gives you is a **durable, replay-deterministic pointer**. You
+supply the bytes. The split matters more than it first appears: because journal
+entries replay identically, a checkpoint id recorded on the first attempt is
+the *same* id after a crash, so the downstream node reconstructs the *same*
+tree rather than something merely equivalent.
+
+### What this demo does
+
+Each agent's workspace is already a git worktree, so a commit *is* a
+content-addressed snapshot of the whole tree — cheap (objects are shared with
+the source repo) and reducible to a 40-byte pointer.
+
+```python
+# end of AgentSession: freeze the tree as this agent left it
+checkpoint_sha = await ctx.run_typed(
+    "checkpoint-workspace",
+    lambda: worktree.checkpoint(spec["workdir"], f"...{spec['agent_id']}"),
+)
+```
+
+```python
+# ReviewWorkflow: the combiner starts FROM a reviewer's frozen workspace
+inherit_from = next(r for r in results if r["agent_id"] == inherit_id)
+start_commit = inherit_from["checkpoint"] or meta["sha"]
+```
+
+The combiner's worktree is created at that sha and soft-reset to the original
+parent, so it sees the reviewed change **plus anything the reviewer left on
+disk**, all as pending work. Verified by reflog on a real run:
+
+```
+0098a69 HEAD@{2}:                      # created at opus's checkpoint
+8d6eb1c HEAD@{1}: reset: moving to …   # soft-reset to the original parent
+8b3616b HEAD@{0}: commit: reviewdemo checkpoint: r6/combiner
+```
+
+`checkpoint()` returns `None` when the agent changed nothing, and the run falls
+back to the pristine commit — no empty snapshots. Set `inherit_workspace` to
+`null` in the request to disable the handoff entirely.
+
+### How crucible does it, and how the two compare
+
+crucible's answer is also git, applied differently. Its `World` abstraction
+defines `snapshot` as a git commit and `restore` as `git reset --hard`, which
+is what powers its keep-or-discard loop. Between plan tasks it uses **one
+shared checkout**; a task marked `isolation = "worktree"` actually gets a
+`git clone --local --no-checkout` (hardlinked objects, despite the flag name),
+and — importantly — **an isolated task's edits are discarded**. What leaves an
+isolated task is its declared structured output, not its tree. For untracked
+derived files it has `[workspace].carry_forward` (git-exclude plus sparing them
+from the discard) and `[[workspace.artifact]]` to publish to S3 or a PR.
+
+On resume, crucible is explicit that reconstructing a task's workspace is a
+**non-goal**. RFC-0002 `C-PLAYBOOK-RESUME`:
+
+> "It MUST NOT attempt to reconstruct the workspace as some particular task
+> left it: when concurrent tasks were in flight at the interruption, no such
+> state is well defined, and a task's declared output is the only part of its
+> work the contract ever promised would survive."
+
+That is a reasonable contract, not a bug — it buys them a simple invariant. But
+it does mean the two systems answer the question differently:
+
+| | crucible | this demo (Restate) |
+|---|---|---|
+| Snapshot mechanism | git commit (`World::snapshot`) | git commit (`worktree.checkpoint`) |
+| Between parallel nodes | shared checkout; **isolated task edits discarded** | explicit checkpoint sha handed to the next node |
+| Untracked/derived files | `carry_forward` + artifact publish | **not handled** — see below |
+| After a crash | pristine checkout + declared outputs, *not* the tree as left | the journaled sha replays identically → same tree |
+| Who stores the bytes | git, plus S3 for artifacts | git (Restate stores only the pointer) |
+
+### So: is it good enough?
+
+**If your checkpoint content is git-trackable — yes, and the replay determinism
+is a genuine edge.** A journaled sha survives orchestrator death and gives the
+downstream node bit-identical state, which is exactly what crucible's resume
+contract declines to promise.
+
+**If it is not git-trackable, neither system solves it and this demo solves it
+less.** Large build outputs, `node_modules`, virtualenvs, caches, binaries: git
+is a poor snapshot store for those, and there is no overlayfs, container image
+commit, or volume snapshot anywhere in either project. crucible at least has
+`carry_forward` and artifact publishing as a partial answer; this demo has
+nothing. The Restate-idiomatic fix is unchanged in shape — put the bytes in a
+content-addressed store (S3, an OCI layer, a btrfs/ZFS snapshot) and journal
+the digest — but that store is something you would still have to build.
+
+**The constraint to design around** is that pointer discipline is mandatory,
+not advisory. Restate state is not a blob store, so "just return the workspace
+from the handler" is never the answer.
 
 ## What we learned driving a real TUI
 
@@ -305,6 +487,9 @@ quiescence, and the artifact check keeps that honest.
   is a real choice to make consciously.
 - **Single machine.** Panes are local to one tmux server. Distributing this
   would mean a remote pane provider (gascity has one; this does not).
+- **Checkpoints only capture git-trackable files.** Untracked build output,
+  virtualenvs and caches are not snapshotted, and there is no content-addressed
+  store for them. See the workspace-durability section for what that would take.
 - **Cost is not metered.** Three low-effort sessions per run is cheap, but
   nothing here enforces a budget.
 
@@ -321,7 +506,7 @@ src/reviewdemo/
   harness/                the seam: claude.py (real), codex.py (untested stub)
   hooks/on_stop.sh        Stop hook -> resolves the awakeable, appends turns.jsonl
 scripts/                  bootstrap / dev / run / clean
-tests/test_harness.py     16 tests: pane classification + real tmux, no LLM calls
+tests/test_harness.py     18 tests: pane classification, checkpoints, real tmux
 docs/                     sample outputs from a real run
 ```
 
